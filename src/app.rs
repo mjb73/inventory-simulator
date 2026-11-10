@@ -120,6 +120,16 @@ pub struct App {
     want_recalc: bool,
     /// When the last rebuild finished. Drives the short pulse on the cards.
     flash: Option<Instant>,
+    /// Earlier versions of the plan, newest first, offered back in the Files
+    /// tab. Read from disk on start and refreshed while the app runs.
+    history: Vec<store::Snapshot>,
+    history_at: Option<Instant>,
+    /// When the last earlier version was written, so ordinary typing does not
+    /// fill the folder with one copy per keystroke.
+    last_snapshot: Option<Instant>,
+    /// The figures from before the last thing that replaced them (a category
+    /// apply, a reset, an opened copy). One press puts them back.
+    undo: Option<(Document, String)>,
 }
 
 /// Book-keeping for the automatic save: what was last written, whether the
@@ -174,6 +184,26 @@ fn default_path() -> String {
 /// How long the "this just happened" pulse lasts.
 const PULSE: Duration = Duration::from_millis(1000);
 
+/// The saved plan, made ready to use — arrays padded to the full 104 weeks,
+/// categories present — but with every figure left exactly as it was stored.
+/// The calculation tidies a private copy when it runs (a packing multiple of
+/// zero behaves as one, and so on); the boxes keep the person's own numbers.
+fn ready_plan(mut doc: Document) -> Document {
+    doc.demand.resize(PERIODS, 0.0);
+    doc.manual.resize(PERIODS, 0.0);
+    doc.demand.truncate(PERIODS);
+    doc.manual.truncate(PERIODS);
+    if doc.presets.is_empty() {
+        doc.presets = presets::default_presets();
+    }
+    if !doc.presets.iter().any(|p| p.name == doc.preset_name) {
+        if let Some(first) = doc.presets.first() {
+            doc.preset_name = first.name.clone();
+        }
+    }
+    doc
+}
+
 /// A cheap fingerprint of everything the plan is built from: the nine values
 /// plus the two rows of 104 weeks. Comparing it is how the window knows whether
 /// the numbers on screen still match the numbers entered.
@@ -209,6 +239,20 @@ fn weeks_phrase(v: f64) -> String {
         "1 week".to_owned()
     } else {
         format!("{} weeks", fmt::qty(v))
+    }
+}
+
+/// "just now", "12 min ago", "3 h ago" — for the earlier versions list.
+fn ago(when: std::time::SystemTime) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(when)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match secs {
+        0..=50 => "just now".to_owned(),
+        51..=3599 => format!("{} min ago", (secs + 30) / 60),
+        3600..=86_399 => format!("{} h ago", secs / 3600),
+        _ => format!("{} days ago", secs / 86_400),
     }
 }
 
@@ -263,8 +307,34 @@ fn recalc_report(before: &Summary, after: &Summary) -> String {
     }
 }
 
+/// Land on category `idx`: keep the figures currently on screen as the outgoing
+/// category's draft (never rewriting its row), then hand back the incoming
+/// category's own last figures, or its row if it has none. Pure so the promise
+/// — switching never loses what was typed — can be tested directly.
+fn switch_to(
+    presets: &mut [Preset],
+    current_name: &str,
+    current: Inputs,
+    idx: usize,
+) -> Option<(Inputs, String, bool)> {
+    let next = presets.get(idx)?.clone();
+    let mut kept = false;
+    if let Some(cur) = presets.iter_mut().find(|p| p.name == current_name) {
+        if cur.inputs != current {
+            cur.draft = Some(current);
+            kept = true;
+        }
+    }
+    Some((next.draft.unwrap_or(next.inputs), next.name, kept))
+}
+
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, shot: Option<PathBuf>, pending_demo: bool) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        shot: Option<PathBuf>,
+        pending_demo: bool,
+        files_demo: bool,
+    ) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, &theme::THEMES[0]);
 
@@ -272,7 +342,11 @@ impl App {
         // run takes a picture and leaves: it starts from the sample plan every
         // time, so the picture cannot depend on whoever last used the app.
         let state_path = store::state_path();
-        let loaded = if shot.is_some() {
+        // A check run starts from the sample plan so the picture never depends
+        // on whoever last used the app — unless a state file is named
+        // explicitly, which is how a look at someone's own plan is taken.
+        let named_state = std::env::var_os("INVENTORY_SIMULATOR_STATE").is_some();
+        let loaded = if shot.is_some() && !named_state {
             Ok(None)
         } else {
             store::load(&state_path)
@@ -284,25 +358,7 @@ impl App {
             Err(e) => (Session::default(), Some(e)),
         };
 
-        let mut doc = session.doc;
-        doc.demand.resize(PERIODS, 0.0);
-        doc.manual.resize(PERIODS, 0.0);
-        doc.demand.truncate(PERIODS);
-        doc.manual.truncate(PERIODS);
-        // A saved plan can hold numbers the sheet would never accept — a zero
-        // rounding multiple, an order rhythm of nought weeks. Tidy them once on
-        // the way in, so the boxes read exactly what the calculation uses.
-        doc.inputs = doc.inputs.sanitised();
-        doc.first_week = doc.first_week.clamp(1, 52);
-        doc.first_year = doc.first_year.clamp(2000, 2100);
-        if doc.presets.is_empty() {
-            doc.presets = presets::default_presets();
-        }
-        if !doc.presets.iter().any(|p| p.name == doc.preset_name) {
-            if let Some(first) = doc.presets.first() {
-                doc.preset_name = first.name.clone();
-            }
-        }
+        let doc = ready_plan(session.doc);
 
         let prefs = session.prefs;
         let theme_idx = prefs.theme_idx.min(theme::THEMES.len() - 1);
@@ -374,7 +430,24 @@ impl App {
             solved,
             want_recalc: false,
             flash: None,
+            history: Vec::new(),
+            history_at: None,
+            last_snapshot: None,
+            undo: None,
         };
+        if persist_enabled && restored {
+            // Keep the plan exactly as it was when the window opened, before
+            // any of this session's changes can touch it. If something later
+            // replaces a figure, this is the version to bring back.
+            if let Ok(json) = serde_json::to_string(&app.session()) {
+                store::write_snapshot(&app.state_path, &json);
+            }
+            app.history = store::snapshots(&app.state_path, 8);
+        }
+        if files_demo {
+            app.show_data = true;
+            app.data_tab = DataTab::Files;
+        }
         if pending_demo {
             // A look-check for the state right after an edit: numbers changed,
             // plan not rebuilt, and the screen says so in three places.
@@ -415,13 +488,69 @@ impl App {
     }
 
     fn apply_preset(&mut self, idx: usize) {
-        if let Some(p) = self.doc.presets.get(idx) {
-            self.doc.inputs = p.inputs;
-            self.doc.preset_name = p.name.clone();
-            self.status = format!(
-                "Values loaded from category \"{}\" — press Recalculate to work the plan out with them.",
-                p.name
-            );
+        let before = (self.doc.preset_name.clone(), self.doc.inputs);
+        let Some((inputs, name, kept)) =
+            switch_to(&mut self.doc.presets, &before.0, before.1, idx)
+        else {
+            return;
+        };
+        self.snapshot_now();
+        self.undo = Some((
+            self.doc.clone(),
+            format!("before loading \"{name}\""),
+        ));
+        self.doc.inputs = inputs;
+        self.doc.preset_name = name.clone();
+        self.status = if kept {
+            format!(
+                "Your figures were kept in the category you were on; \"{name}\" figures loaded. Press Recalculate to work the plan out with them."
+            )
+        } else {
+            format!(
+                "Values loaded from category \"{name}\" — press Recalculate to work the plan out with them."
+            )
+        };
+    }
+
+    /// Keep a copy of the plan as it stands now. Called before anything that
+    /// replaces the figures on screen, and now and then while the person works.
+    fn snapshot_now(&mut self) {
+        if !self.persist.enabled {
+            return;
+        }
+        if let Ok(json) = serde_json::to_string(&self.session()) {
+            store::write_snapshot(&self.state_path, &json);
+            self.last_snapshot = Some(Instant::now());
+            self.history = store::snapshots(&self.state_path, 8);
+            self.history_at = Some(Instant::now());
+        }
+    }
+
+    /// Put a whole different plan on screen (an earlier version, a copy from
+    /// disk, the sample). The figures being replaced stay a press away.
+    fn replace_plan(&mut self, mut doc: Document, what: String) {
+        self.snapshot_now();
+        self.undo = Some((self.doc.clone(), what));
+        doc.demand.resize(PERIODS, 0.0);
+        doc.manual.resize(PERIODS, 0.0);
+        doc.demand.truncate(PERIODS);
+        doc.manual.truncate(PERIODS);
+        if doc.presets.is_empty() {
+            doc.presets = presets::default_presets();
+        }
+        self.doc = doc;
+        self.h_offset = 0.0;
+        // A different plan was loaded, not a number typed: work it out now so
+        // the screen never shows one plan's figures under another's inputs.
+        self.recompute();
+    }
+
+    fn undo_replace(&mut self) {
+        if let Some((doc, what)) = self.undo.take() {
+            self.snapshot_now();
+            self.doc = doc;
+            self.recompute();
+            self.status = format!("Put your figures back as they were {what}.");
         }
     }
 
@@ -487,6 +616,17 @@ impl App {
             Ok(()) => {
                 self.persist.error = None;
                 self.persist.saved = true;
+                // Now and then, keep this version too. Not on every keystroke:
+                // one an hour of work would be plenty, one a minute is easier
+                // to reason about and costs a few kilobytes.
+                let due = self
+                    .last_snapshot
+                    .map(|t| t.elapsed() >= Duration::from_secs(60))
+                    .unwrap_or(true);
+                if due && store::write_snapshot(&self.state_path, &json).is_some() {
+                    self.last_snapshot = Some(Instant::now());
+                    self.history_at = None;
+                }
             }
             Err(e) => self.persist.error = Some(e),
         }
@@ -562,19 +702,11 @@ impl App {
     }
 
     fn reset_to_sample(&mut self) {
-        let kept = store::keep_previous(&self.state_path);
-        self.doc = Document::default();
-        self.h_offset = 0.0;
-        // A different plan was loaded, not a number typed: work it out now so
-        // the screen never opens on someone else's figures.
-        self.recompute();
-        self.status = match kept {
-            Some(p) => format!(
-                "Sample plan restored. Your previous numbers were kept in {}.",
-                p.display()
-            ),
-            None => "Sample plan restored.".to_owned(),
-        };
+        self.replace_plan(
+            Document::default(),
+            "before starting fresh with the sample".to_owned(),
+        );
+        self.status = "Sample plan restored — your previous figures are in the earlier versions list, and Undo puts them back.".to_owned();
     }
 
     fn save_plan(&mut self) {
@@ -592,14 +724,8 @@ impl App {
         let path = PathBuf::from(self.path_buf.clone());
         match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Document>(&text) {
-                Ok(mut doc) => {
-                    doc.demand.resize(PERIODS, 0.0);
-                    doc.manual.resize(PERIODS, 0.0);
-                    if doc.presets.is_empty() {
-                        doc.presets = presets::default_presets();
-                    }
-                    self.doc = doc;
-                    self.recompute();
+                Ok(doc) => {
+                    self.replace_plan(doc, format!("before opening {}", path.display()));
                     self.status = format!("Plan opened from {}", path.display());
                 }
                 Err(e) => self.status = format!("That file is not a saved plan: {e}"),
@@ -1152,6 +1278,17 @@ impl App {
                         );
                         ui.add_space(4.0);
                         self.save_chip(ui, theme);
+                        if self.undo.is_some() {
+                            if ghost(ui, theme, "Undo", false)
+                                .on_hover_text(
+                                    "Put back the figures from before the last category change, reset or opened copy.",
+                                )
+                                .clicked()
+                            {
+                                self.undo_replace();
+                            }
+                            ui.add_space(4.0);
+                        }
                         self.recalc_chip(ui, theme);
                     });
                 });
@@ -1199,14 +1336,37 @@ impl App {
                             }
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
-                                if ghost(ui, theme, "Apply values", false).clicked() {
-                                    if let Some(i) = self
+                                if ghost(ui, theme, "Reload row", false)
+                                    .on_hover_text(
+                                        "Put this category's own row values back, discarding the changes you made since.",
+                                    )
+                                    .clicked()
+                                {
+                                    let name = self.doc.preset_name.clone();
+                                    let row = self
                                         .doc
                                         .presets
                                         .iter()
-                                        .position(|p| p.name == self.doc.preset_name)
-                                    {
-                                        self.apply_preset(i);
+                                        .find(|p| p.name == name)
+                                        .map(|p| p.inputs);
+                                    if let Some(row_inputs) = row {
+                                        self.snapshot_now();
+                                        self.undo = Some((
+                                            self.doc.clone(),
+                                            "before reloading the row".to_owned(),
+                                        ));
+                                        self.doc.inputs = row_inputs;
+                                        if let Some(p) = self
+                                            .doc
+                                            .presets
+                                            .iter_mut()
+                                            .find(|p| p.name == name)
+                                        {
+                                            p.draft = None;
+                                        }
+                                        self.status = format!(
+                                            "Category \"{name}\" row values put back — press Recalculate to work the plan out with them."
+                                        );
                                     } else {
                                         self.status =
                                             "That category is not in the list.".to_owned();
@@ -1220,6 +1380,7 @@ impl App {
                                         .find(|p| p.name == self.doc.preset_name)
                                     {
                                         p.inputs = self.doc.inputs;
+                                        p.draft = None;
                                         self.status =
                                             format!("Category \"{}\" now holds these values.", p.name);
                                     }
@@ -1284,7 +1445,7 @@ impl App {
                                 "",
                                 0,
                                 1.0,
-                                1.0,
+                                0.0,
                             );
                             int_row_min(
                                 ui,
@@ -1326,7 +1487,7 @@ impl App {
                                 "Look-ahead weeks",
                                 "Safety stock also covers this many weeks of demand that follow each week.",
                                 &mut self.doc.inputs.safety_weeks,
-                                52,
+                                PERIODS as u32,
                             );
                             ui.add_space(4.0);
                             ui.label(
@@ -1393,14 +1554,12 @@ impl App {
                     }),
             )
             .show(ui, |ui| {
-                // Nothing may fall off the bottom on a small window — the amber
-                // "changes waiting" note adds a row, so the whole column
-                // scrolls when it has to.
+                // Nothing may fall off the bottom on a small window — the whole
+                // column scrolls when it has to.
                 egui::ScrollArea::vertical()
                     .id_salt("centre_column")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.pending_banner(ui, theme);
                         self.kpis(ui, theme);
                         ui.add_space(10.0);
                         self.chart_card(ui, theme);
@@ -1410,38 +1569,9 @@ impl App {
             });
     }
 
-    /// Shown only while a number typed does not yet appear in the plan: one
-    /// plain sentence and the button that fixes it, right where the person is
-    /// looking.
-    fn pending_banner(&mut self, ui: &mut Ui, theme: &Theme) {
-        if !self.pending() {
-            return;
-        }
-        egui::Frame::new()
-            .fill(theme.warn.gamma_multiply(0.10))
-            .stroke(Stroke::new(1.0, theme.warn.gamma_multiply(0.40)))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::symmetric(12, 6))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 3.5, theme.warn);
-                    ui.label(
-                        RichText::new("Your changes are waiting — the plan below is the one worked out before them.")
-                            .font(theme::body(12.0))
-                            .color(theme.warn),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ghost(ui, theme, "Recalculate now", false).clicked() {
-                            ui.ctx().memory_mut(|m| m.stop_text_input());
-                            self.want_recalc = true;
-                        }
-                    });
-                });
-            });
-        ui.add_space(10.0);
-    }
+    /// Edits wait for the Recalculate button; the button itself is the only cue
+    /// (amber ring while a change is pending), so no second note or button is
+    /// drawn here.
 
     fn kpis(&mut self, ui: &mut Ui, theme: &Theme) {
         let s = self.summary.clone();
@@ -1993,6 +2123,19 @@ impl App {
                         );
                         ui.add_space(8.0);
                         let mut remove: Option<usize> = None;
+                        // Names as they are before the table is drawn, so a
+                        // rename can follow the selected category instead of
+                        // losing track of which figures belong to it.
+                        let names_before: Vec<String> = self
+                            .doc
+                            .presets
+                            .iter()
+                            .map(|p| p.name.clone())
+                            .collect();
+                        let selected_name = self.doc.preset_name.clone();
+                        // Figures typed into the selected category's row drive
+                        // the plan, exactly like editing the Parameters sheet.
+                        let mut row_edit: Option<Inputs> = None;
                         egui::ScrollArea::vertical()
                             .max_height(320.0)
                             .show(ui, |ui| {
@@ -2018,7 +2161,11 @@ impl App {
                                                 egui::TextEdit::singleline(&mut p.name)
                                                     .font(TextStyle::Body),
                                             );
-                                            preset_fields(ui, theme, &mut p.inputs);
+                                            let changed = preset_fields(ui, theme, &mut p.inputs);
+                                            if changed && p.name == selected_name {
+                                                p.draft = None;
+                                                row_edit = Some(p.inputs);
+                                            }
                                             if ghost(ui, theme, "×", false).clicked() {
                                                 remove = Some(idx);
                                             }
@@ -2026,6 +2173,20 @@ impl App {
                                         }
                                     });
                             });
+                        if let Some(inputs) = row_edit {
+                            self.doc.inputs = inputs;
+                            self.status = "Category figures changed — press Recalculate to work the plan out with them.".to_owned();
+                        }
+                        if let Some(i) = names_before
+                            .iter()
+                            .position(|n| *n == self.doc.preset_name)
+                        {
+                            if let Some(now) = self.doc.presets.get(i) {
+                                if now.name != self.doc.preset_name {
+                                    self.doc.preset_name = now.name.clone();
+                                }
+                            }
+                        }
                         if let Some(i) = remove {
                             if self.doc.presets.len() > 1 {
                                 let gone = self.doc.presets.remove(i);
@@ -2040,6 +2201,7 @@ impl App {
                                 self.doc.presets.push(Preset {
                                     name: name.clone(),
                                     inputs: self.doc.inputs,
+                                    draft: None,
                                 });
                                 self.doc.preset_name = name;
                                 self.status = "Category added with the current values.".to_owned();
@@ -2085,12 +2247,94 @@ impl App {
                                 );
                             });
 
-                        ui.add_space(12.0);
-                        ui.label(
-                            RichText::new("Copies and spreadsheets")
-                                .font(theme::heading(12.5))
-                                .color(theme.dim),
-                        );
+                            ui.add_space(14.0);
+                            // ---- earlier versions ---------------------------------
+                            // The promise the person asked for: nothing replaces
+                            // their figures without them being able to get them
+                            // back, from right here.
+                            if self
+                                .history_at
+                                .map(|t| t.elapsed() >= Duration::from_secs(2))
+                                .unwrap_or(true)
+                            {
+                                self.history = store::snapshots(&self.state_path, 7);
+                                self.history_at = Some(Instant::now());
+                            }
+                            ui.label(
+                                RichText::new("Earlier versions of your figures")
+                                    .font(theme::heading(12.5))
+                                    .color(theme.dim),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "A copy is kept here now and then while you work, and just before anything replaces the numbers on screen. Bring one back and the figures you had are kept here too.",
+                                )
+                                .font(theme::body(10.5))
+                                .color(theme.faint),
+                            );
+                            ui.add_space(4.0);
+                            let mut bring_back: Option<usize> = None;
+                            if self.history.is_empty() {
+                                ui.label(
+                                    RichText::new("No earlier versions yet — they appear as you work.")
+                                        .font(theme::mono(10.5))
+                                        .color(theme.faint),
+                                );
+                            } else {
+                                for (i, s) in self.history.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(ago(s.when))
+                                                .font(theme::mono(10.5))
+                                                .color(theme.dim),
+                                        );
+                                        ui.label(
+                                            RichText::new(s.preset.as_str())
+                                                .font(theme::body(11.0))
+                                                .color(theme.text),
+                                        )
+                                        .on_hover_text(format!(
+                                            "Kept in {}",
+                                            s.path.display()
+                                        ));
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "opening {} · min lot {} · safety {} · {} wks filled",
+                                                fmt::qty(s.inputs.opening_stock),
+                                                fmt::qty(s.inputs.min_lot),
+                                                fmt::qty(s.inputs.static_safety),
+                                                s.filled_weeks
+                                            ))
+                                            .font(theme::mono(9.5))
+                                            .color(theme.faint),
+                                        );
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            if ghost(ui, theme, "Bring back", false).clicked() {
+                                                bring_back = Some(i);
+                                            }
+                                        });
+                                    });
+                                }
+                            }
+                            if let Some(i) = bring_back {
+                                if let Some(s) = self.history.get(i).cloned() {
+                                    let label = ago(s.when);
+                                    self.replace_plan(
+                                        s.doc.clone(),
+                                        format!("before bringing back the version from {label}"),
+                                    );
+                                    self.status = format!(
+                                        "Brought back your figures from {label}. The ones you had are in this list, and Undo puts them straight back."
+                                    );
+                                }
+                            }
+
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new("Copies and spreadsheets")
+                                    .font(theme::heading(12.5))
+                                    .color(theme.dim),
+                            );
                         ui.label(
                             RichText::new(
                                 "A copy is a named file you choose — handy for keeping a second version, or for handing the plan to someone else.",
@@ -2240,7 +2484,12 @@ impl App {
                 body(
                     ui,
                     "When it is worked out",
-                    "Typing a number — a value on the left, or a demand or manual receipt in the weekly plan — never changes the plan by itself. It waits, with an amber note on screen, until you press Recalculate (or F5). Then every row is worked out again from scratch and the status bar says what moved.",
+                    "Typing a number — a value on the left, or a demand or manual receipt in the weekly plan — never changes the plan by itself. It waits, and the Recalculate button at the top turns amber until you press it (or F5). Then every row is worked out again from scratch and the status bar says what moved.",
+                );
+                body(
+                    ui,
+                    "Your figures stay yours",
+                    "Opening the app never rewrites a number you typed: a packing multiple of 0 stays 0, an opening stock of 0 stays 0, and the boxes show exactly what is saved. A category's row on the Categories tab is the figures it starts with; your own changes under that category are kept with it, so switching away and back finds them again, and Reload row puts the row's own figures back. Anything that does replace the numbers on screen — loading a category, reloading a row, starting fresh, opening a copy, bringing back an earlier version — can be undone with the Undo button in the status bar, and every version is kept in Data & files under Earlier versions of your figures.",
                 );
                 ui.separator();
                 ui.label(
@@ -2572,19 +2821,27 @@ fn coverage_row(ui: &mut Ui, theme: &Theme, values: &[f64], row: usize) -> Rect 
     resp.response.rect
 }
 
-fn preset_fields(ui: &mut Ui, theme: &Theme, inputs: &mut Inputs) {
+/// The nine boxes of one category row. Returns true when the person changed
+/// one of them this frame, so the selected category's row can drive the plan.
+fn preset_fields(ui: &mut Ui, theme: &Theme, inputs: &mut Inputs) -> bool {
     let _ = &theme;
     ui.style_mut().override_font_id = Some(theme::mono(11.0));
     ui.spacing_mut().interact_size.x = 58.0;
-    ui.add(egui::DragValue::new(&mut inputs.opening_stock).speed(10.0).range(0.0..=1e9).max_decimals(0));
-    ui.add(egui::DragValue::new(&mut inputs.min_lot).speed(10.0).range(0.0..=1e9).max_decimals(0));
-    ui.add(egui::DragValue::new(&mut inputs.rounding).speed(1.0).range(1.0..=1e6).max_decimals(0));
-    ui.add(egui::DragValue::new(&mut inputs.frozen_period).speed(0.25).range(0..=PERIODS as u32));
-    ui.add(egui::DragValue::new(&mut inputs.order_frequency).speed(0.25).range(1..=PERIODS as u32));
-    ui.add(egui::DragValue::new(&mut inputs.static_safety).speed(10.0).range(0.0..=1e9).max_decimals(0));
-    ui.add(egui::DragValue::new(&mut inputs.safety_weeks).speed(0.25).range(0..=52u32));
-    ui.add(egui::DragValue::new(&mut inputs.tolerance_pct).speed(1.0).range(0.0..=500.0).max_decimals(0));
-    ui.add(egui::DragValue::new(&mut inputs.lower_pct).speed(1.0).range(0.0..=100.0).max_decimals(0));
+    let mut changed = false;
+    for resp in [
+        ui.add(egui::DragValue::new(&mut inputs.opening_stock).speed(10.0).range(0.0..=1e9).max_decimals(0)),
+        ui.add(egui::DragValue::new(&mut inputs.min_lot).speed(10.0).range(0.0..=1e9).max_decimals(0)),
+        ui.add(egui::DragValue::new(&mut inputs.rounding).speed(1.0).range(0.0..=1e6).max_decimals(0)),
+        ui.add(egui::DragValue::new(&mut inputs.frozen_period).speed(0.25).range(0..=PERIODS as u32)),
+        ui.add(egui::DragValue::new(&mut inputs.order_frequency).speed(0.25).range(1..=PERIODS as u32)),
+        ui.add(egui::DragValue::new(&mut inputs.static_safety).speed(10.0).range(0.0..=1e9).max_decimals(0)),
+        ui.add(egui::DragValue::new(&mut inputs.safety_weeks).speed(0.25).range(0..=PERIODS as u32)),
+        ui.add(egui::DragValue::new(&mut inputs.tolerance_pct).speed(1.0).range(0.0..=500.0).max_decimals(0)),
+        ui.add(egui::DragValue::new(&mut inputs.lower_pct).speed(1.0).range(0.0..=100.0).max_decimals(0)),
+    ] {
+        changed |= resp.changed();
+    }
+    changed
 }
 
 /// Text dump used while verifying the port against the original macros.
@@ -2686,6 +2943,65 @@ mod tests {
             lowest_coverage: cover,
             ..Default::default()
         }
+    }
+
+    /// Switching category must never throw away the figures typed under the
+    /// one being left, and must not rewrite that category's own row either.
+    #[test]
+    fn switching_category_keeps_typed_figures_and_leaves_the_row_alone() {
+        let mut presets = presets::default_presets();
+        let row_before = presets[0].inputs;
+        let mut typed = presets[0].inputs;
+        typed.opening_stock = 1234.0;
+        typed.min_lot = 0.0;
+        typed.rounding = 0.0;
+        typed.static_safety = 0.0;
+
+        let first = presets[0].name.clone();
+        let second = presets[1].name.clone();
+        let (next_inputs, next_name, kept) = switch_to(&mut presets, &first, typed, 1).unwrap();
+        assert!(kept, "the screen says the figures were kept");
+        assert_eq!(next_name, second);
+        assert_eq!(next_inputs, presets[1].inputs);
+        assert_eq!(
+            presets[0].inputs, row_before,
+            "the Parameters row is not rewritten behind the person's back"
+        );
+        assert_eq!(presets[0].draft, Some(typed), "the typed figures are kept");
+
+        let (back, back_name, _) = switch_to(&mut presets, &second, next_inputs, 0).unwrap();
+        assert_eq!(back_name, first);
+        assert_eq!(back, typed, "coming back finds the person's own figures");
+        assert_eq!(back.rounding, 0.0);
+    }
+
+    /// Opening a saved plan must not rewrite a single figure. A packing
+    /// multiple of zero, a static buffer of zero, an opening stock of zero —
+    /// all of them stay exactly as the person left them; the calculation
+    /// tidies its own copy instead.
+    #[test]
+    fn opening_a_plan_keeps_every_figure_as_it_was_typed() {
+        let mut saved = Document::default();
+        saved.inputs.opening_stock = 0.0;
+        saved.inputs.min_lot = 0.0;
+        saved.inputs.rounding = 0.0;
+        saved.inputs.static_safety = 0.0;
+        saved.inputs.frozen_period = 0;
+        saved.inputs.safety_weeks = 3;
+        saved.inputs.tolerance_pct = 30.0;
+        saved.inputs.lower_pct = 30.0;
+        saved.demand = vec![0.0, 0.0, 2500.0];
+        saved.manual = vec![0.0];
+
+        let ready = ready_plan(saved.clone());
+        assert_eq!(ready.inputs, saved.inputs, "not one input may move");
+        assert_eq!(ready.demand.len(), PERIODS, "weeks padded to the plan length");
+        assert_eq!(ready.demand[2], 2500.0);
+        assert_eq!(ready.manual.len(), PERIODS);
+
+        // And the plan still calculates with those figures.
+        let (res, _) = engine::run(&ready.inputs, &ready.demand, &ready.manual);
+        assert!(res.receipts.iter().any(|v| *v > 0.0));
     }
 
     /// The button must never answer with a bare "done": either it names the

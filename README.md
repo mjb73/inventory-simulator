@@ -35,6 +35,11 @@ on top of that.
   and the order quantities, with the frozen period shaded.
 * **Data window.** Paste or type a whole demand or manual-receipt row, generate
   a seasonal demand curve, and import/export CSV.
+* **Your figures stay yours.** Opening the plan never rewrites a number you
+  typed, and switching category keeps the figures from the one you were on.
+  Anything that replaces the numbers on screen can be undone from the status
+  bar, and earlier versions of the whole plan are kept and listed under
+  **Data & files → Earlier versions**, each one a press away.
 * **Autosave.** The plan is kept between runs; "Save a copy" and "Start fresh"
   are there for named copies and resets.
 * **Four themes**, keyboard shortcuts, and every figure explained in the help
@@ -89,6 +94,7 @@ Command line options:
 --screenshot <file.png>   draw the window, save a picture, exit (used by checks)
 --selftest                print the calculation results as JSON
 --pending-demo            draw the "changes waiting" state
+--files-demo              open the Data & files window on the Files tab
 ```
 
 ## How the numbers are made

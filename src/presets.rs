@@ -7,7 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Preset {
     pub name: String,
+    /// The Parameters-sheet row: the figures this category starts with.
     pub inputs: Inputs,
+    /// The last figures typed while this category was selected, kept apart
+    /// from the row so switching away and back finds them again and the row
+    /// itself is never rewritten behind the person's back.
+    #[serde(default)]
+    pub draft: Option<Inputs>,
 }
 
 /// Column captions for the preset editor, in sheet order (B..J).
@@ -27,6 +33,7 @@ fn p(name: &str, i: Inputs) -> Preset {
     Preset {
         name: name.to_owned(),
         inputs: i,
+        draft: None,
     }
 }
 

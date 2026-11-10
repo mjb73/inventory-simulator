@@ -40,6 +40,7 @@ fn print_help() {
     println!("  --screenshot <file.png>   draw the window, save a picture and exit");
     println!("  --selftest                print the calculation results as JSON");
     println!("  --pending-demo            draw the \"changes waiting\" state instead");
+    println!("  --files-demo              open the Data & files window on the Files tab");
 }
 
 /// The little window/taskbar mark, drawn into the executable so a copy of the
@@ -59,6 +60,7 @@ fn main() -> eframe::Result<()> {
     let mut shot: Option<PathBuf> = None;
     let mut selftest = false;
     let mut pending_demo = false;
+    let mut files_demo = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -68,6 +70,7 @@ fn main() -> eframe::Result<()> {
             }
             "--selftest" => selftest = true,
             "--pending-demo" => pending_demo = true,
+            "--files-demo" => files_demo = true,
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -112,6 +115,7 @@ fn main() -> eframe::Result<()> {
                 cc,
                 shot_for_app.clone(),
                 pending_demo,
+                files_demo,
             )))
         }),
     )
