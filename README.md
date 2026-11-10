@@ -53,6 +53,10 @@ chmod +x inventory-simulator
 ./inventory-simulator
 ```
 
+It needs a desktop with OpenGL and the xkbcommon X11 library; most desktops
+already have these, and on Ubuntu/Debian they are `sudo apt install
+libxkbcommon-x11-0 libgl1`. If either is missing the window will not open.
+
 On Windows, double-click `inventory-simulator.exe`. The first launch may show a
 SmartScreen prompt because the file is not code-signed; "More info → Run anyway"
 continues. Your plan is stored in `%APPDATA%\inventory-simulator\plan.json`

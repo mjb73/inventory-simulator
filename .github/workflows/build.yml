@@ -15,13 +15,13 @@ jobs:
     name: Linux (x86-64)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install windowing headers
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev libegl1-mesa-dev
+            pkg-config libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libgl1-mesa-dev libegl1-mesa-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -36,8 +36,11 @@ jobs:
         run: cargo build --release
 
       - name: Check the window draws
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
         run: |
-          sudo apt-get install -y --no-install-recommends xvfb libgl1-mesa-dri
+          sudo apt-get install -y --no-install-recommends xvfb libgl1-mesa-dri \
+            libxkbcommon-x11-0 libgl1
           mkdir -p shots
           xvfb-run -a --server-args="-screen 0 1560x976x24" \
             ./target/release/inventory-simulator --screenshot shots/ci.png
@@ -49,7 +52,7 @@ jobs:
             -C target/release inventory-simulator \
             -C "$PWD" README.md LICENSE
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: inventory-simulator-linux-x86_64
           path: inventory-simulator-linux-x86_64.tar.gz
@@ -59,7 +62,7 @@ jobs:
     name: Windows (x86-64)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -78,7 +81,7 @@ jobs:
           Compress-Archive -Path target/release/inventory-simulator.exe, README.md, LICENSE `
             -DestinationPath inventory-simulator-windows-x86_64.zip -Force
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: inventory-simulator-windows-x86_64
           path: inventory-simulator-windows-x86_64.zip
