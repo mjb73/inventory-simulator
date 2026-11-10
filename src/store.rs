@@ -181,20 +181,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod probe_tests {
-    use super::*;
-
-    #[test]
-    fn probe_override_and_parse() {
-        let p = std::path::Path::new("/tmp/inv-w52.json");
-        println!("exists {}", p.exists());
-        match load(p) {
-            Ok(Some(s)) => println!("loaded week {} year {} demand0 {}", s.doc.first_week, s.doc.first_year, s.doc.demand.get(0).copied().unwrap_or(-1.0)),
-            Ok(None) => println!("NOT FOUND"),
-            Err(e) => println!("ERR {e}"),
-        }
-        std::env::set_var("INVENTORY_SIMULATOR_STATE", "/tmp/inv-w52.json");
-        println!("path now {:?}", state_path());
-    }
-}
