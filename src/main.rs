@@ -112,7 +112,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             Ok(Box::new(app::App::new(
-                cc,
+                &cc.egui_ctx,
                 shot_for_app.clone(),
                 pending_demo,
                 files_demo,

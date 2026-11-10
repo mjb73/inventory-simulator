@@ -30,7 +30,10 @@ on top of that.
   worked out. The workbook's reference receipts and week-by-week requirement are
   still calculated behind the scenes but are not listed, and the start-of-week
   balance is not listed either (cover weeks are worked out from it). Rows scroll
-  sideways in blocks of weeks.
+  sideways in blocks of weeks, and <kbd>Tab</kbd> (<kbd>Shift</kbd>+<kbd>Tab</kbd>)
+  steps from one week's box to the next — the columns shift by one when the
+  cursor reaches the last week in view, so the box being typed in stays on
+  screen.
 * **Stock cover chart.** Closing stock, safety stock, lower and upper thresholds
   and the order quantities, with the frozen period shaded.
 * **Data window.** Paste or type a whole demand or manual-receipt row, generate

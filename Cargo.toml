@@ -1,6 +1,6 @@
 [package]
 name = "inventory-simulator"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "104-week inventory cover and replenishment planner"
 license = "MIT"

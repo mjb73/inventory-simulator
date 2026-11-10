@@ -130,6 +130,18 @@ pub struct App {
     /// The figures from before the last thing that replaced them (a category
     /// apply, a reset, an opened copy). One press puts them back.
     undo: Option<(Document, String)>,
+    /// Which week's box held the keyboard last frame. The table only rolls
+    /// sideways when the cursor itself moves on — never every frame, or the
+    /// scrollbar could not be dragged.
+    focused_week: Option<usize>,
+    /// The box ids of the two editable rows, week by week. Only the keyboard
+    /// checks read this; it is how a check knows where the cursor went.
+    #[cfg(test)]
+    edit_ids: (Vec<egui::Id>, Vec<egui::Id>),
+    /// How wide the weekly table's window was on the last pass, for the same
+    /// checks.
+    #[cfg(test)]
+    table_view: f32,
 }
 
 /// Book-keeping for the automatic save: what was last written, whether the
@@ -330,13 +342,13 @@ fn switch_to(
 
 impl App {
     pub fn new(
-        cc: &eframe::CreationContext<'_>,
+        ctx: &egui::Context,
         shot: Option<PathBuf>,
         pending_demo: bool,
         files_demo: bool,
     ) -> Self {
-        theme::install_fonts(&cc.egui_ctx);
-        theme::apply(&cc.egui_ctx, &theme::THEMES[0]);
+        theme::install_fonts(ctx);
+        theme::apply(ctx, &theme::THEMES[0]);
 
         // Pick up whatever was on screen when the app was last closed. A check
         // run takes a picture and leaves: it starts from the sample plan every
@@ -434,6 +446,11 @@ impl App {
             history_at: None,
             last_snapshot: None,
             undo: None,
+            focused_week: None,
+            #[cfg(test)]
+            edit_ids: (Vec::new(), Vec::new()),
+            #[cfg(test)]
+            table_view: 0.0,
         };
         if persist_enabled && restored {
             // Keep the plan exactly as it was when the window opened, before
@@ -1068,6 +1085,15 @@ fn kpi_card(
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+}
+
+impl App {
+    /// Everything the window shows, in one pass. Split out of
+    /// [`eframe::App::ui`] so the same screen can be driven without a window
+    /// (the keyboard checks run this against a bare context).
+    pub fn draw(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         if self.applied_theme != self.theme_idx {
             theme::apply(&ctx, &theme::THEMES[self.theme_idx]);
@@ -1787,6 +1813,8 @@ impl App {
         let mut header_rect = Rect::NOTHING;
         let mut gutter = Rect::NOTHING;
         let mut scroll_rect = Rect::NOTHING;
+        // The two editable rows' box ids, week by week.
+        let mut edit_ids: (Vec<egui::Id>, Vec<egui::Id>) = (Vec::new(), Vec::new());
 
         card(theme).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1868,8 +1896,13 @@ impl App {
                                 })
                                 .response
                                 .rect;
-                            rows.push(editable_row(ui, theme, &mut doc.demand, 0));
-                            rows.push(editable_row(ui, theme, &mut doc.manual, 1));
+                            let (demand_rect, demand_ids) =
+                                editable_row(ui, theme, &mut doc.demand, 0);
+                            rows.push(demand_rect);
+                            let (manual_rect, manual_ids) =
+                                editable_row(ui, theme, &mut doc.manual, 1);
+                            rows.push(manual_rect);
+                            edit_ids = (demand_ids, manual_ids);
                             rows.push(value_row(ui, theme, &res.receipts, theme.good, 2, true));
                             rows.push(balance_row(ui, theme, &res.end_stock, 3));
                             rows.push(value_row(ui, theme, &res.safety_stock, theme.warn, 4, false));
@@ -1952,6 +1985,33 @@ impl App {
         });
 
         self.h_offset = offset;
+        // Tab carries the keyboard from one week's box to the next. While that
+        // box is on screen nothing moves; once it would be past the last week
+        // in view, the columns step across by one so the box being typed in
+        // stays put on screen instead of walking off the right-hand edge. The
+        // step is only taken when the keyboard itself moves, so the scrollbar
+        // can still be dragged while a box holds the cursor.
+        let focused = ui.ctx().memory(|m| m.focused());
+        let focused_week = focused.and_then(|id| {
+            edit_ids
+                .0
+                .iter()
+                .position(|cell| *cell == id)
+                .or_else(|| edit_ids.1.iter().position(|cell| *cell == id))
+        });
+        if focused_week.is_some() && focused_week != self.focused_week {
+            if let Some(next) = focused_week
+                .and_then(|week| offset_to_reveal(offset, scroll_rect.width(), week))
+            {
+                self.h_offset = next;
+            }
+        }
+        self.focused_week = focused_week;
+        #[cfg(test)]
+        {
+            self.edit_ids = edit_ids;
+            self.table_view = scroll_rect.width();
+        }
         if let Some(t) = new_target {
             // Jump both the table and the graph to that block of weeks.
             self.h_offset = t as f32 * CELL_W;
@@ -2488,6 +2548,11 @@ impl App {
                 );
                 body(
                     ui,
+                    "Typing across the weeks",
+                    "Click a box in Demand or Manual receipts and type, then press Tab to move one week to the right, or Shift+Tab to go back one. The plan steps along with the cursor: when it reaches the last week in view, the columns shift by one so the box being typed in stays on screen instead of sliding off the right-hand edge. Typing is still only typing — the figures wait for Recalculate.",
+                );
+                body(
+                    ui,
                     "Your figures stay yours",
                     "Opening the app never rewrites a number you typed: a packing multiple of 0 stays 0, an opening stock of 0 stays 0, and the boxes show exactly what is saved. A category's row on the Categories tab is the figures it starts with; your own changes under that category are kept with it, so switching away and back finds them again, and Reload row puts the row's own figures back. Anything that does replace the numbers on screen — loading a category, reloading a row, starting fresh, opening a copy, bringing back an earlier version — can be undone with the Undo button in the status bar, and every version is kept in Data & files under Earlier versions of your figures.",
                 );
@@ -2559,12 +2624,12 @@ fn row_meta(theme: &Theme) -> Vec<(&'static str, &'static str, Color32)> {
     vec![
         (
             "Demand",
-            "Weekly demand, in units. Editable — drag a number or click it and type.",
+            "Weekly demand, in units. Editable — drag a number or click it and type. Tab steps to the next week.",
             theme.text,
         ),
         (
             "Manual receipts",
-            "Stock you know is arriving (row 10). Editable; a manual receipt blocks the automatic order for that week.",
+            "Stock you know is arriving (row 10). Editable; a manual receipt blocks the automatic order for that week. Tab steps to the next week.",
             theme.warn,
         ),
         (
@@ -2705,7 +2770,7 @@ fn text_cell(ui: &mut Ui, text: &str, color: Color32, bg: Option<Color32>) {
     }
 }
 
-fn edit_cell(ui: &mut Ui, value: &mut f64, bg: Option<Color32>) {
+fn edit_cell(ui: &mut Ui, value: &mut f64, bg: Option<Color32>) -> egui::Id {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(CELL_W, ROW_H), Sense::hover());
     if let Some(bg) = bg {
         ui.painter().rect_filled(rect, 0.0, bg);
@@ -2721,30 +2786,63 @@ fn edit_cell(ui: &mut Ui, value: &mut f64, bg: Option<Color32>) {
     child.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
     child.visuals_mut().widgets.inactive.bg_fill = Color32::TRANSPARENT;
     child.visuals_mut().widgets.inactive.bg_stroke = Stroke::NONE;
-    child.add(
-        egui::DragValue::new(value)
-            .speed(2.0)
-            .range(0.0..=1.0e9)
-            .max_decimals(0)
-            .min_decimals(0)
-            // Same grouped text as the calculated rows ("1,500", not "1500");
-            // typing keeps working because commas are stripped again.
-            .custom_formatter(|n, _| fmt::qty(n))
-            .custom_parser(fmt::parse_qty),
-    );
+    child
+        .add(
+            egui::DragValue::new(value)
+                .speed(2.0)
+                .range(0.0..=1.0e9)
+                .max_decimals(0)
+                .min_decimals(0)
+                // Same grouped text as the calculated rows ("1,500", not "1500");
+                // typing keeps working because commas are stripped again.
+                .custom_formatter(|n, _| fmt::qty(n))
+                .custom_parser(fmt::parse_qty),
+        )
+        .id
 }
 
-fn editable_row(ui: &mut Ui, theme: &Theme, values: &mut [f64], row: usize) -> Rect {
+/// One editable week across the plan. The ids come back with the rect so the
+/// card can tell which week the keyboard is in.
+fn editable_row(ui: &mut Ui, theme: &Theme, values: &mut [f64], row: usize) -> (Rect, Vec<egui::Id>) {
+    let mut ids = Vec::with_capacity(PERIODS);
     let resp = ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         for i in 0..PERIODS {
             if i >= values.len() {
                 break;
             }
-            edit_cell(ui, &mut values[i], stripe(theme, row));
+            ids.push(edit_cell(ui, &mut values[i], stripe(theme, row)));
         }
     });
-    resp.response.rect
+    (resp.response.rect, ids)
+}
+
+/// The weeks the table can show at once: the first one at its left edge and the
+/// last one wholly on screen. A column counts once its left edge is inside the
+/// view, so a sliver hanging over the right edge is not the last visible week.
+fn visible_weeks(offset: f32, view_w: f32) -> (usize, usize) {
+    let per = (view_w / CELL_W).floor().max(1.0) as usize;
+    let per = per.min(PERIODS);
+    let first = ((offset.max(0.0) / CELL_W).floor() as usize).min(PERIODS - 1);
+    let last = (first + per - 1).min(PERIODS - 1);
+    (first, last)
+}
+
+/// Where the table has to sit for `week` to be inside the view — or `None` when
+/// it already is. Tabbing on from the last visible week moves the columns by
+/// exactly one, which is what makes the plan step across instead of letting the
+/// box being typed in slide off the right-hand edge.
+fn offset_to_reveal(offset: f32, view_w: f32, week: usize) -> Option<f32> {
+    let (first, last) = visible_weeks(offset, view_w);
+    if week > last {
+        let per = ((view_w / CELL_W).floor().max(1.0) as usize).min(PERIODS);
+        let start = (week + 1).saturating_sub(per).min(PERIODS - per);
+        Some(start as f32 * CELL_W)
+    } else if week < first {
+        Some(week as f32 * CELL_W)
+    } else {
+        None
+    }
 }
 
 fn value_row(
@@ -2935,6 +3033,198 @@ pub fn selftest() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window without a screen: the same screen the real one draws, fed the
+    /// same keystrokes, laid out by a bare egui context. Used for the keyboard
+    /// checks, which cannot be done by looking at a picture.
+    struct Bench {
+        ctx: egui::Context,
+        app: App,
+        size: egui::Vec2,
+    }
+
+    impl Bench {
+        fn new() -> Self {
+            // The saved plan stays untouched: a throwaway file stands in for
+            // the one the person's own figures live in.
+            let scratch = std::env::temp_dir().join(format!(
+                "inventory-bench-{}-{:?}.json",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::env::set_var("INVENTORY_SIMULATOR_STATE", &scratch);
+            let ctx = egui::Context::default();
+            let app = App::new(&ctx, None, false, false);
+            Self {
+                ctx,
+                app,
+                size: egui::vec2(1560.0, 976.0),
+            }
+        }
+
+        fn pump(&mut self, events: Vec<egui::Event>) {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                self.size,
+            ));
+            raw.events = events;
+            let app = &mut self.app;
+            let _ = self.ctx.run_ui(raw, |ui| app.draw(ui));
+        }
+
+        fn settle(&mut self) {
+            for _ in 0..3 {
+                self.pump(Vec::new());
+            }
+        }
+
+        /// One Tab (or Shift+Tab) press, the way the window manager sends it.
+        fn tab(&mut self, backwards: bool) -> f32 {
+            let modifiers = if backwards {
+                egui::Modifiers::SHIFT
+            } else {
+                egui::Modifiers::NONE
+            };
+            self.pump(vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: Some(egui::Key::Tab),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }]);
+            self.app.h_offset
+        }
+    }
+
+    /// Which weeks a given width shows, and where the table has to sit for a
+    /// week outside them.
+    #[test]
+    fn a_week_past_the_edge_moves_the_columns_by_exactly_one() {
+        let view = CELL_W * 14.0 + 20.0; // fourteen whole weeks, then a sliver
+        assert_eq!(visible_weeks(0.0, view), (0, 13));
+        assert_eq!(offset_to_reveal(0.0, view, 13), None, "still on screen");
+        assert_eq!(
+            offset_to_reveal(0.0, view, 14),
+            Some(CELL_W),
+            "one step past the edge is one column of movement"
+        );
+        assert_eq!(offset_to_reveal(0.0, view, 20), Some(7.0 * CELL_W));
+        assert_eq!(
+            offset_to_reveal(5.0 * CELL_W, view, 3),
+            Some(3.0 * CELL_W),
+            "coming back in from the left puts that week at the left edge"
+        );
+        // A sliver on the right is not a visible week: the last one on screen
+        // is the last one that is wholly there.
+        assert_eq!(visible_weeks(CELL_W * 2.0 + 7.0, view), (2, 15));
+        // Never past the end of the plan.
+        assert_eq!(
+            offset_to_reveal(0.0, view, PERIODS - 1),
+            Some((PERIODS - 14) as f32 * CELL_W)
+        );
+        // Nothing to do when every week already fits.
+        assert_eq!(offset_to_reveal(0.0, CELL_W * 200.0, 40), None);
+    }
+
+    /// A figure typed into a week's box is the figure the plan keeps, even when
+    /// the Tab that leaves the box is the one that rolls the columns along.
+    #[test]
+    fn a_figure_typed_before_the_tab_is_still_there_after_it() {
+        let mut bench = Bench::new();
+        bench.settle();
+        let (_, last) = visible_weeks(0.0, bench.app.table_view);
+        // The last week wholly on screen, reached the way a person reaches it:
+        // tabbing in from the week before it.
+        let week = last;
+        assert!(week + 1 < PERIODS, "there is a week beyond the edge");
+
+        let previous_id = bench.app.edit_ids.0[week - 1];
+        let id = bench.app.edit_ids.0[week];
+        let next_id = bench.app.edit_ids.0[week + 1];
+        bench.ctx.memory_mut(|mem| mem.request_focus(previous_id));
+        bench.settle();
+        bench.tab(false);
+        bench.settle();
+        assert_eq!(
+            bench.ctx.memory(|mem| mem.focused()),
+            Some(id),
+            "the cursor is in the last box on screen"
+        );
+
+        // Arriving by Tab selects the figure, so typing replaces it.
+        bench.pump(vec![egui::Event::Text("1234".to_owned())]);
+        let before = bench.app.h_offset;
+        let after = bench.tab(false);
+        bench.settle(); // the figure is taken when the box loses focus
+
+        assert_eq!(
+            bench.app.doc.demand[week], 1234.0,
+            "the typed figure is kept when the cursor leaves"
+        );
+        assert_eq!(
+            bench.ctx.memory(|mem| mem.focused()),
+            Some(next_id),
+            "the cursor went on to the next week"
+        );
+        assert!(
+            (after - before - CELL_W).abs() < 0.01,
+            "and leaving the last week on screen rolled the columns by one ({before} → {after})"
+        );
+    }
+
+
+    /// Tabbing across the weekly plan carries the columns along with the
+    /// cursor, one column at a time, and never in a jump.
+    #[test]
+    fn tabbing_across_the_weeks_steps_the_columns_one_at_a_time() {
+        let mut bench = Bench::new();
+        bench.settle();
+        assert_eq!(bench.app.h_offset, 0.0, "the plan starts at week one");
+
+        let mut previous = bench.app.h_offset;
+        let mut steps: Vec<f32> = Vec::new();
+        for _ in 0..60 {
+            let now = bench.tab(false);
+            if (now - previous).abs() > 0.01 {
+                steps.push(now - previous);
+            }
+            previous = now;
+        }
+
+        assert!(
+            steps.len() >= 5,
+            "the table never followed the cursor ({:?})",
+            steps
+        );
+        for step in &steps {
+            assert!(
+                (step - CELL_W).abs() < 0.01,
+                "a step of {step} px is not one column"
+            );
+        }
+        assert!(
+            (previous / CELL_W).fract().abs() < 0.001,
+            "the table settled on a column edge"
+        );
+
+        // And the other way: Shift+Tab walks back, one column at a time.
+        let mut back: Vec<f32> = Vec::new();
+        for _ in 0..40 {
+            let now = bench.tab(true);
+            if (now - previous).abs() > 0.01 {
+                back.push(now - previous);
+            }
+            previous = now;
+        }
+        assert!(!back.is_empty(), "the table never came back");
+        for step in &back {
+            assert!(
+                (step + CELL_W).abs() < 0.01,
+                "a step of {step} px is not one column back"
+            );
+        }
+    }
 
     fn summary(orders: usize, units: f64, cover: f64) -> Summary {
         Summary {
