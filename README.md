@@ -25,9 +25,12 @@ on top of that.
   changed number waits for the **Recalculate** button (or <kbd>F5</kbd>), and the
   screen says what changed and what the rebuild did in plain words.
 * **Weekly plan table.** Demand and manual receipts are editable; order
-  receipts, stock balance, closing stock, safety stock, both thresholds, cover
-  weeks and a week-by-week classification (frozen, in range, over, below
-  trigger, …) are worked out. Rows scroll sideways in blocks of weeks.
+  receipts, closing stock, safety stock, both thresholds, cover weeks and a
+  week-by-week classification (frozen, in range, over, below trigger, …) are
+  worked out. The workbook's reference receipts and week-by-week requirement are
+  still calculated behind the scenes but are not listed, and the start-of-week
+  balance is not listed either (cover weeks are worked out from it). Rows scroll
+  sideways in blocks of weeks.
 * **Stock cover chart.** Closing stock, safety stock, lower and upper thresholds
   and the order quantities, with the frozen period shaded.
 * **Data window.** Paste or type a whole demand or manual-receipt row, generate

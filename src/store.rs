@@ -15,14 +15,13 @@ use crate::chart::ChartOptions;
 pub const FORMAT: u32 = 1;
 
 /// The bits of the window's own setup worth remembering: which theme, which
-/// chart lines are on, whether the planning rows show, how far the weeks are
-/// scrolled, and the numbers last used by the demand generator.
+/// chart lines are on, how far the weeks are scrolled, and the numbers last
+/// used by the demand generator.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
     pub theme_idx: usize,
     pub chart: ChartOptions,
-    pub planning_rows: bool,
     pub pattern: PatternSettings,
     pub h_offset: f32,
 }
@@ -32,7 +31,6 @@ impl Default for Prefs {
         Self {
             theme_idx: 0,
             chart: ChartOptions::default(),
-            planning_rows: true,
             pattern: PatternSettings::default(),
             h_offset: 0.0,
         }

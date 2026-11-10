@@ -95,7 +95,6 @@ pub struct App {
     pub show_help: bool,
     pub data_tab: DataTab,
     pub chart: ChartOptions,
-    pub planning_rows: bool,
     /// Shared sideways position of the graph and the weekly table, in pixels.
     pub h_offset: f32,
     pub frames: u64,
@@ -316,7 +315,6 @@ impl App {
             prefs: Prefs {
                 theme_idx,
                 chart: prefs.chart,
-                planning_rows: prefs.planning_rows,
                 pattern: prefs.pattern,
                 h_offset: prefs.h_offset,
             },
@@ -362,7 +360,6 @@ impl App {
             show_help: false,
             data_tab: DataTab::Demand,
             chart: prefs.chart,
-            planning_rows: prefs.planning_rows,
             h_offset: prefs.h_offset,
             frames: 0,
             shot,
@@ -436,7 +433,6 @@ impl App {
             prefs: Prefs {
                 theme_idx: self.theme_idx,
                 chart: self.chart,
-                planning_rows: self.planning_rows,
                 pattern: self.pattern,
                 h_offset: self.h_offset,
             },
@@ -619,28 +615,7 @@ impl App {
     }
 
     fn export_csv(&mut self) {
-        let mut out = String::from(
-            "Week,Demand,ManualReceipts,Receipts,ClosingStock,SafetyStock,LowerThreshold,UpperThreshold,CoverageWeeks,PlannedReceipts,WeeklyRequirement,Period\n",
-        );
-        for i in 0..PERIODS {
-            out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{}\n",
-                i + 1,
-                self.doc.demand[i],
-                self.doc.manual[i],
-                self.results.receipts[i],
-                self.results.end_stock[i],
-                self.results.safety_stock[i],
-                self.results.lower_threshold[i],
-                self.results.upper_threshold[i],
-                self.results.coverage[i],
-                self.results.planned_receipts[i],
-                self.results.weekly_requirement[i],
-                // Last, so the importer (which reads the first three columns)
-                // still reads this file back unchanged.
-                self.doc.period(i)
-            ));
-        }
+        let out = build_csv(&self.doc, &self.results);
         let path = self.csv_path();
         let stale = self.pending();
         match std::fs::write(&path, out) {
@@ -1390,7 +1365,7 @@ impl App {
                         ui.add_space(12.0);
                         ui.label(
                             RichText::new(
-                                "Spreadsheet rows: demand 8 · orders 9 · receipts 10 · safety 11 · upper 12 · balance 13 (hidden) · lower 14 · cover 15 · reference 16 · classification 19 · need 20.",
+                                "Spreadsheet rows: demand 8 · orders 9 · receipts 10 · safety 11 · upper 12 · balance 13 (hidden) · lower 14 · cover 15 · reference 16 (hidden) · classification 19 · need 20 (hidden).",
                             )
                             .font(theme::body(10.0))
                             .color(theme.faint),
@@ -1671,14 +1646,13 @@ impl App {
     fn table_card(&mut self, ui: &mut Ui, theme: &Theme) {
         let mut new_target: Option<usize> = None;
         let mut copy = false;
-        let mut planned = self.planning_rows;
         let mut offset = self.h_offset;
         let waiting = self.pending();
         let frozen = self.solved.frozen_period as usize;
         let res = &self.results;
         let doc = &mut self.doc;
         let tsv = build_tsv(doc, res);
-        let metas = row_meta(theme, planned);
+        let metas = row_meta(theme);
         let mut rows: Vec<Rect> = Vec::with_capacity(metas.len());
         let mut header_rect = Rect::NOTHING;
         let mut gutter = Rect::NOTHING;
@@ -1708,13 +1682,6 @@ impl App {
                     if ghost(ui, theme, "Copy table", false).clicked() {
                         copy = true;
                     }
-                    ui.add_space(6.0);
-                    ui.checkbox(
-                        &mut planned,
-                        RichText::new("planning rows")
-                            .font(theme::mono(10.5))
-                            .color(theme.dim),
-                    );
                     ui.add_space(6.0);
                     // Four blocks of 26 weeks. The button carries the period the
                     // block starts on — the same label the columns use — and the
@@ -1794,24 +1761,6 @@ impl App {
                             ));
                             rows.push(coverage_row(ui, theme, &res.coverage, 7));
                             rows.push(classification_row(ui, theme, res, frozen, 8));
-                            if planned {
-                                rows.push(value_row(
-                                    ui,
-                                    theme,
-                                    &res.planned_receipts,
-                                    theme.good.gamma_multiply(0.8),
-                                    9,
-                                    false,
-                                ));
-                                rows.push(value_row(
-                                    ui,
-                                    theme,
-                                    &res.weekly_requirement,
-                                    theme.dim,
-                                    10,
-                                    false,
-                                ));
-                            }
                         });
                     });
                 scroll_rect = sa.inner_rect;
@@ -1872,7 +1821,6 @@ impl App {
             // it is always on screen.
         });
 
-        self.planning_rows = planned;
         self.h_offset = offset;
         if let Some(t) = new_target {
             // Jump both the table and the graph to that block of weeks.
@@ -2258,13 +2206,13 @@ impl App {
                 );
                 body(
                     ui,
-                    "Order receipts (rows 9 and 20)",
-                    "From the week after the frozen period, every week whose projected closing balance would fall under safety stock gets a requirement: at least the minimum lot size, rounded up to the packing multiple. Those weekly requirements are then pulled together onto your order rhythm and booked in the first week of each window that has demand. Manual receipts block automatic orders in their own week.",
+                    "Order receipts (row 9)",
+                    "From the week after the frozen period, every week whose projected closing balance would fall under safety stock gets a requirement: at least the minimum lot size, rounded up to the packing multiple. That week-by-week need (the sheet's row 20) is then pulled together onto your order rhythm and booked in the first week of each window that has demand; only the booked orders are listed. Manual receipts block automatic orders in their own week.",
                 );
                 body(
                     ui,
-                    "Upper line (rows 12 and 16)",
-                    "A reference plan built without manual receipts and without a frozen period. Its closing balance plus the tolerance % is the upper line: stock above it is more than the rhythm really needs.",
+                    "Upper line (row 12)",
+                    "A reference plan built without manual receipts and without a frozen period. Its closing balance plus the tolerance % is the upper line: stock above it is more than the rhythm really needs. The receipts behind that reference plan (the sheet's row 16) are worked out but no longer listed.",
                 );
                 body(
                     ui,
@@ -2297,7 +2245,7 @@ impl App {
                 ui.separator();
                 ui.label(
                     RichText::new(
-                        "Column mapping: demand row 8 · order receipts row 9 · manual receipts row 10 · safety stock row 11 · upper line row 12 · lower line row 14 · cover row 15 · reference receipts row 16 · classification row 19 · weekly requirement row 20. The opening balance (row 13) is not listed any more, but cover weeks are still worked out from it. Closing stock is that opening balance after the week's demand — the solid line on the graph, and the figure to read against the upper line.",
+                        "Column mapping: demand row 8 · order receipts row 9 · manual receipts row 10 · safety stock row 11 · upper line row 12 · lower line row 14 · cover row 15 · classification row 19. Three workbook rows are worked out but not listed: the opening balance (row 13), the reference receipts (row 16) and the weekly requirement (row 20) — cover weeks come from the opening balance and the two reference rows build the upper line. Closing stock is that opening balance after the week's demand — the solid line on the graph, and the figure to read against the upper line.",
                     )
                     .font(theme::body(11.0))
                     .color(theme.faint),
@@ -2311,13 +2259,38 @@ impl App {
 
 // ------------------------------------------------------------- grid cells --
 
-fn build_tsv(doc: &Document, res: &Results) -> String {
+/// The spreadsheet copy of the table: the same rows the person sees, in the
+/// same order, with the period as the last column so the importer — which reads
+/// the first three — still reads this file back unchanged.
+fn build_csv(doc: &Document, res: &Results) -> String {
     let mut out = String::from(
-        "Week\tPeriod\tDemand\tManual receipts\tOrder receipts\tClosing stock\tSafety stock\tLower trigger\tUpper line\tCover (weeks)\tReference receipts\tWeekly need\n",
+        "Week,Demand,ManualReceipts,Receipts,ClosingStock,SafetyStock,LowerThreshold,UpperThreshold,CoverageWeeks,Period\n",
     );
     for i in 0..PERIODS {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{},{},{},{},{},{},{},{},{},{}\n",
+            i + 1,
+            doc.demand[i],
+            doc.manual[i],
+            res.receipts[i],
+            res.end_stock[i],
+            res.safety_stock[i],
+            res.lower_threshold[i],
+            res.upper_threshold[i],
+            res.coverage[i],
+            doc.period(i)
+        ));
+    }
+    out
+}
+
+fn build_tsv(doc: &Document, res: &Results) -> String {
+    let mut out = String::from(
+        "Week\tPeriod\tDemand\tManual receipts\tOrder receipts\tClosing stock\tSafety stock\tLower trigger\tUpper line\tCover (weeks)\n",
+    );
+    for i in 0..PERIODS {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             i + 1,
             doc.period(i),
             doc.demand[i],
@@ -2327,16 +2300,14 @@ fn build_tsv(doc: &Document, res: &Results) -> String {
             res.safety_stock[i],
             res.lower_threshold[i],
             res.upper_threshold[i],
-            res.coverage[i],
-            res.planned_receipts[i],
-            res.weekly_requirement[i]
+            res.coverage[i]
         ));
     }
     out
 }
 
-fn row_meta(theme: &Theme, planned: bool) -> Vec<(&'static str, &'static str, Color32)> {
-    let mut rows = vec![
+fn row_meta(theme: &Theme) -> Vec<(&'static str, &'static str, Color32)> {
+    vec![
         (
             "Demand",
             "Weekly demand, in units. Editable — drag a number or click it and type.",
@@ -2382,20 +2353,7 @@ fn row_meta(theme: &Theme, planned: bool) -> Vec<(&'static str, &'static str, Co
             "One word per week, as in row 19 of the sheet: frozen inside the frozen period, below when the closing stock is under the lower trigger, over when it is above the upper line, in range otherwise.",
             theme.dim,
         ),
-    ];
-    if planned {
-        rows.push((
-            "Reference receipts",
-            "Receipts of the reference plan without manual receipts or a frozen period (row 16).",
-            theme.good.gamma_multiply(0.8),
-        ));
-        rows.push((
-            "Weekly need",
-            "Unconsolidated weekly requirement before orders are gathered (row 20).",
-            theme.dim,
-        ));
-    }
-    rows
+    ]
 }
 
 /// Row 19 of the sheet: a word per column saying how that week stands against
@@ -2782,7 +2740,7 @@ mod tests {
     #[test]
     fn the_table_hides_the_opening_balance() {
         let th = &theme::THEMES[0];
-        let names: Vec<&str> = row_meta(th, true).iter().map(|r| r.0).collect();
+        let names: Vec<&str> = row_meta(th).iter().map(|r| r.0).collect();
         assert!(!names.contains(&"Stock balance"), "{names:?}");
         assert!(names.contains(&"Closing stock"), "{names:?}");
         assert!(names.contains(&"Cover (weeks)"), "{names:?}");
@@ -2799,5 +2757,68 @@ mod tests {
         // Cover is still worked out from that hidden balance, so it must not
         // vanish with the row.
         assert!(res.coverage.iter().any(|c| *c > 0.0));
+    }
+
+    /// The reference receipts and the week-by-week need are working rows behind
+    /// the upper line and the bookings; the person asked for them to be hidden,
+    /// so neither the table nor its copy may show them. The numbers themselves
+    /// must still be there, because the upper line and the orders are built
+    /// from them.
+    #[test]
+    fn the_table_hides_the_reference_and_need_rows() {
+        let th = &theme::THEMES[0];
+        let names: Vec<&str> = row_meta(th).iter().map(|r| r.0).collect();
+        assert!(!names.contains(&"Reference receipts"), "{names:?}");
+        assert!(!names.contains(&"Weekly need"), "{names:?}");
+        assert_eq!(
+            names,
+            vec![
+                "Demand",
+                "Manual receipts",
+                "Order receipts",
+                "Closing stock",
+                "Safety stock",
+                "Lower trigger",
+                "Upper line",
+                "Cover (weeks)",
+                "Classification",
+            ],
+            "{names:?}"
+        );
+
+        let doc = Document::default();
+        let (res, _) = engine::run(&doc.inputs, &doc.demand, &doc.manual);
+        let tsv = build_tsv(&doc, &res);
+        let header = tsv.lines().next().unwrap_or_default();
+        assert_eq!(header.matches('\t').count(), 9, "{header}");
+        for hidden in ["Reference receipts", "Weekly need", "row 16", "row 20"] {
+            assert!(!header.contains(hidden), "{header} shows {hidden}");
+        }
+        // Every listed row has exactly one cell per week.
+        for line in tsv.lines() {
+            assert_eq!(line.matches('\t').count(), 9, "{line}");
+        }
+        // The working numbers are still computed; only their rows are gone.
+        assert!(res.planned_receipts.iter().any(|v| *v > 0.0));
+        assert!(res.weekly_requirement.iter().any(|v| *v > 0.0));
+    }
+
+    /// The spreadsheet out must hold the rows the table holds — no hidden
+    /// working rows leaking back in through the CSV.
+    #[test]
+    fn the_csv_lists_exactly_the_visible_rows() {
+        let doc = Document::default();
+        let (res, _) = engine::run(&doc.inputs, &doc.demand, &doc.manual);
+        let csv = build_csv(&doc, &res);
+        assert_eq!(
+            csv.lines().next().unwrap_or_default(),
+            "Week,Demand,ManualReceipts,Receipts,ClosingStock,SafetyStock,LowerThreshold,UpperThreshold,CoverageWeeks,Period"
+        );
+        for line in csv.lines() {
+            assert_eq!(line.matches(',').count(), 9, "{line}");
+        }
+        assert_eq!(csv.lines().count(), PERIODS + 1);
+        assert!(!csv.contains("PlannedReceipts"));
+        assert!(!csv.contains("WeeklyRequirement"));
     }
 }
