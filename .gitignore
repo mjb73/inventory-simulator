@@ -1,0 +1,16 @@
+# Build output
+/target/
+
+# Pictures taken by the screenshot option while working
+/shots/
+
+# Editor and OS leftovers
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Saved plan copies kept beside the binary
+plan.json
+plan.*.json

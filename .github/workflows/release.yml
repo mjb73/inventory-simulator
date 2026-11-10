@@ -1,0 +1,105 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Linux build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install windowing headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+            libegl1-mesa-dev xvfb libgl1-mesa-dri
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux
+
+      - name: Tests
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Check the window draws
+        run: |
+          mkdir -p shots
+          xvfb-run -a --server-args="-screen 0 1560x976x24" \
+            ./target/release/inventory-simulator --screenshot shots/release.png
+          test -s shots/release.png
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG="inventory-simulator-${VERSION}-linux-x86_64"
+          mkdir -p "dist/$PKG"
+          cp target/release/inventory-simulator README.md LICENSE "dist/$PKG/"
+          tar -czf "dist/$PKG.tar.gz" -C dist "$PKG"
+          echo "PKG=$PKG" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+
+      - name: Tests
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          $pkg = "inventory-simulator-$version-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path "dist/$pkg" | Out-Null
+          Copy-Item target/release/inventory-simulator.exe, README.md, LICENSE "dist/$pkg/"
+          Compress-Archive -Path "dist/$pkg/*" -DestinationPath "dist/$pkg.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish downloads
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

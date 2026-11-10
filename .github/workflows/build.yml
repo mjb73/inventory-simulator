@@ -1,0 +1,85 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux (x86-64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install windowing headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libgl1-mesa-dev libegl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux
+
+      - name: Tests
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Check the window draws
+        run: |
+          sudo apt-get install -y --no-install-recommends xvfb libgl1-mesa-dri
+          mkdir -p shots
+          xvfb-run -a --server-args="-screen 0 1560x976x24" \
+            ./target/release/inventory-simulator --screenshot shots/ci.png
+          test -s shots/ci.png
+
+      - name: Package
+        run: |
+          tar -czf inventory-simulator-linux-x86_64.tar.gz \
+            -C target/release inventory-simulator \
+            -C "$PWD" README.md LICENSE
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inventory-simulator-linux-x86_64
+          path: inventory-simulator-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows (x86-64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+
+      - name: Tests
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          Compress-Archive -Path target/release/inventory-simulator.exe, README.md, LICENSE `
+            -DestinationPath inventory-simulator-windows-x86_64.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inventory-simulator-windows-x86_64
+          path: inventory-simulator-windows-x86_64.zip
+          if-no-files-found: error
